@@ -172,7 +172,7 @@ instance Result UTCTime where
                 case parseTime defaultTimeLocale "%F %T%Q" (B8.unpack bs) of
                   Just t -> t
                   Nothing -> conversionFailed f "UTCTime" "could not parse"
-        where ok = mkCompats [Timestamp]
+        where ok = mkCompats [TimestampWithZone]
 
 instance Result Day where
     convert f = flip (atto ok) f $ date
