@@ -22,6 +22,8 @@ module Database.PostgreSQL.Base
 import           Database.PostgreSQL.Base.Types
 
 import           Control.Concurrent
+import           Control.Concurrent.Edge
+import           Control.Exception
 import           Control.Monad
 import           Control.Monad.CatchIO          (MonadCatchIO)
 import qualified Control.Monad.CatchIO          as E
@@ -79,14 +81,103 @@ defaultConnectInfo = ConnectInfo {
 --   an exception if it cannot connect.
 connect :: MonadIO m => ConnectInfo -> m Connection -- ^ The datase connection.
 connect connectInfo@ConnectInfo{..} = liftIO $ withSocketsDo $ do
-  var <- newEmptyMVar
+  req <- newEmptyMVar
   h <- connectTo connectHost (PortNumber $ fromIntegral connectPort)
   hSetBuffering h NoBuffering
-  putMVar var $ Just h
+  (source, sink) <- newEdge
+  forkIO (mux req h sink)
+  forkIO (demux h source)
   types <- newMVar M.empty
-  let conn = Connection var types
+  let conn = Connection req types
   authenticate conn connectInfo
   return conn
+
+-- | a mux process accepts requests from external programs,  sends
+-- the request to the database,  and tells the demuxer where to send
+-- the result.
+
+mux = loop
+  where
+    loop req h demux = do
+       (str, dest) <- takeMVar req `catches`
+                     [ handler req demux :: BlockedIndefinitelyOnMVar -> IO a
+                     , handler req demux :: DatabaseClosedException   -> IO a ]
+       writeSink demux dest
+       L.hPut h str `catch` \(x :: IOException) -> closed req
+       loop req h demux
+
+    handler req demux x = do
+       -- FIXME:  we should send a "close the connection" message to
+       -- the database.   But when?  Can we send the message now
+       -- and keep the connection open until we finish getting results?
+       -- Or do we have to wait and have the demux send the message?
+       
+       -- It sounds like a terminate message will cause an immediate hangup
+       writeSink demux (throw DatabaseClosedException)
+       closed req
+
+    closed req = do
+        (_str, dest) <- takeMVar' req
+        writeSink dest  (throw DatabaseClosedException)
+        closed req
+      where
+        takeMVar' req = takeMVar req `catch`
+              \(_ :: DatabaseClosedException) -> takeMVar' req
+
+-- | a demux process listens on a database connection and sends
+-- the incoming messages to the appropriate destination.
+
+demux h dests = loop
+  where
+    nextDest = do
+      -- If I block on dests, then I can't receive async notifications
+      -- If I block on the handle,  then I can't receive database disconnects
+      -- I could signal database disconnects with an asynchronous exception,
+      -- but that's just *asking* for trouble.
+      dest <- readSource dests `catch` databaseClosed
+      msg  <- getMessage_ h
+      loop dest msg
+
+    loop dest (messageType, len, block)
+      | L.length block /= len = do
+           x <- IO.hIsEOF h
+           if x
+             then do
+                writeSink dest DatabaseClosedException
+                closed
+             else error "demux: impossible error"
+      | messageType = 'Z' = do
+           writeSink dest (messageType, block)
+           nextDest
+      | otherwise = do
+           writeSink dest (messageType, block)
+           loop dest =<< getMessage_ h
+
+    closed = do
+      dest <- readSource dests
+      writeSink dest (throw DatabaseClosedException)
+      closed
+
+    databaseClosed :: DatabaseClosedException -> IO a
+    databaseClosed e = hClose h >> throwIO e
+
+{-
+An alternative design would be 
+
+   Connection Server     Request sucker     Response Sucker
+
+But how would you throttle the incoming requests?  The current design
+has an "elegant feel" to it,  but perhaps it's fundamentally flawed.
+
+Or maybe not.   We want to service a disconnect request as soon as possible,
+we want to keep the connection open for as long as we are receive data,  but 
+we want to stop accepting requests.  Pending requests 
+should be sent a DatabaseClosedException.  
+
+This would require more threads
+
+-}
+
 
 -- | Run a an action with a connection and close the connection
 --   afterwards (protects against exceptions).
@@ -122,12 +213,8 @@ begin conn = do
 -- | Close a connection. Can safely be called any number of times.
 close :: MonadIO m => Connection -- ^ The connection.
       -> m ()
-close Connection{connectionHandle} = liftIO$ do
-  modifyMVar_ connectionHandle $ \h -> do
-    case h of
-      Just h -> hClose h
-      Nothing -> return ()
-    return Nothing
+close Connection{connectionRequest} = liftIO $ do
+    putMVar connectionRequest (throw DatabaseClosedException)
 
 -- | Run a simple query on a connection.
 query :: (MonadCatchIO m)
@@ -168,7 +255,7 @@ exec conn sql = do
   case result of
     (ok,_) -> return ok
 
--- | PostgreSQL protocol version supported by this library.    
+-- | PostgreSQL protocol version supported by this library.
 protocolVersion :: Int32
 protocolVersion = 196608
 
@@ -221,7 +308,7 @@ getConnectInfoResponse h conninfo = do
               _salt = flip runGet block $ do
                         _ <- getInt32
                         getWord8
-    
+
     els -> E.throw $ AuthenticationFailed (show (els,block))
 
 -- | Send the pass as clear text and wait for connect response.
@@ -491,13 +578,18 @@ sendBlock h typ output = do
           toByte c = fromIntegral (fromEnum c) :: Word8
 
 -- | Get a message (block) from the stream.
-getMessage :: Handle -> IO (MessageType,L.ByteString)
-getMessage h = do
+getMessage_ :: Handle -> IO (Char,Int,L.ByteString)
+getMessage_ h = do
   messageType <- L.hGet h 1
   blockLength <- L.hGet h int32Size
   let typ = decode messageType
       rest = fromIntegral (decode blockLength :: Int32) - int32Size
   block <- L.hGet h rest
+  return (typ,rest,block)
+
+getMessage :: Handle -> IO (MessageType,L.ByteString)
+getMessage h = do
+  (typ,_, block) <- getMessage_ h
   return (maybe UnknownMessageType id $ typeFromChar typ,block)
 
 --------------------------------------------------------------------------------

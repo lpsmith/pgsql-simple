@@ -13,10 +13,12 @@ module Database.PostgreSQL.Base.Types
   ,ObjectId(..)
   ,Pool(..)
   ,PoolState(..)
-  ,ConnectionError(..))
+  ,ConnectionError(..)
+  ,DatabaseClosedException(..))
   where
 
 import Control.Concurrent.MVar (MVar)
+import Control.Concurrent.Edge (Sink)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 import Data.Int
@@ -49,8 +51,8 @@ data ConnectInfo = ConnectInfo {
 
 -- | A database connection.
 data Connection = Connection {
-      connectionHandle  :: MVar (Maybe Handle)
-    , connectionObjects :: MVar (Map ObjectId String)
+      connectionRequest       :: MVar (ByteString, Sink (Char, ByteString))
+    , connectionObjects       :: MVar (Map ObjectId String)
     }
 
 -- | Result of a database query.
@@ -134,3 +136,10 @@ data PoolState = PoolState {
   }
 
 newtype Pool = Pool { unPool :: MVar PoolState }
+
+
+data DatabaseClosedException = DatabaseClosedException 
+  deriving (Show, Typeable) 
+
+instance Exception DatabaseClosedException
+
