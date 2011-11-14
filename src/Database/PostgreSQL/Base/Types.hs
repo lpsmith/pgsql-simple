@@ -1,7 +1,7 @@
 {-# OPTIONS -Wall #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 module Database.PostgreSQL.Base.Types
-  (ConnectInfo(..)
+{-  (ConnectInfo(..)
   ,Connection(..)
   ,Field(..)
   ,Result(..)
@@ -14,11 +14,11 @@ module Database.PostgreSQL.Base.Types
   ,Pool(..)
   ,PoolState(..)
   ,ConnectionError(..)
-  ,DatabaseClosedException(..))
+  ,DatabaseClosedException(..)) -}
   where
 
 import Control.Concurrent.MVar (MVar)
-import Control.Concurrent.Edge (Sink)
+import Control.Concurrent.Edge (Sink, Source, List)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 import Data.Int
@@ -51,9 +51,25 @@ data ConnectInfo = ConnectInfo {
 
 -- | A database connection.
 data Connection = Connection {
-      connectionRequest       :: MVar (ByteString, Sink (Char, ByteString))
+      connectionRequest       :: MVar Dialog
+    , connectionEvent         :: MVar Event
     , connectionObjects       :: MVar (Map ObjectId String)
     }
+
+data    Dialog  = Dialog (Source ReqMsg) (List RspMsg)
+
+data    PGHandle = PGHandle (Source RspMsg) (Sink ReqMsg)
+
+data    ReqMsg  = ReqMsg L.ByteString
+                | Done
+                  deriving (Show)
+
+data    RspMsg  = RspMsg !Char !L.ByteString
+                  deriving (Show)
+
+data    Event   = Request  Dialog
+                | Response RspMsg
+                | Disconnected ConnectionClosed
 
 -- | Result of a database query.
 data Result =
@@ -138,8 +154,13 @@ data PoolState = PoolState {
 newtype Pool = Pool { unPool :: MVar PoolState }
 
 
-data DatabaseClosedException = DatabaseClosedException 
+data ConnectionClosed = ConnectionClosed
   deriving (Show, Typeable) 
 
-instance Exception DatabaseClosedException
+instance Exception ConnectionClosed
+
+data InternalException = InternalException
+  deriving (Show, Typeable) 
+
+instance Exception InternalException
 

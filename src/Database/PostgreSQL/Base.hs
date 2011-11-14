@@ -1,6 +1,7 @@
 {-# OPTIONS_GHC -Wall -fno-warn-name-shadowing #-}
 {-# LANGUAGE RecordWildCards, OverloadedStrings, ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts, ViewPatterns, NamedFieldPuns, TupleSections #-}
+{-# LANGUAGE DoAndIfThenElse #-}
 
 -- | A front-end implementation for the PostgreSQL database protocol
 --   version 3.0 (implemented in PostgreSQL 7.4 and later).
@@ -44,9 +45,12 @@ import           Data.Map                       (Map)
 import qualified Data.Map                       as M
 import           Data.Maybe
 import           Data.Monoid
+import qualified Data.Vector.Mutable            as V
 import           Network
-import           Prelude
+import           Prelude                        hiding (catch)
 import           System.IO                      hiding (hPutStr)
+import           Data.Bits((.&.))
+import           Debug.Trace
 
 --------------------------------------------------------------------------------
 -- Exported values
@@ -81,103 +85,165 @@ defaultConnectInfo = ConnectInfo {
 --   an exception if it cannot connect.
 connect :: MonadIO m => ConnectInfo -> m Connection -- ^ The datase connection.
 connect connectInfo@ConnectInfo{..} = liftIO $ withSocketsDo $ do
-  req <- newEmptyMVar
-  h <- connectTo connectHost (PortNumber $ fromIntegral connectPort)
-  hSetBuffering h NoBuffering
+  event    <- newEmptyMVar
+  throttle <- newMVar ()
+  request  <- newEmptyMVar
   (source, sink) <- newEdge
-  forkIO (mux req h sink)
-  forkIO (demux h source)
+  handle   <- connectTo connectHost (PortNumber $ fromIntegral connectPort)
+  hSetBuffering handle NoBuffering
+  _ <- forkIO (connectionRouter event  throttle sink handle)
+  _ <- forkIO (requestListener  event  throttle request)
+  _ <- forkIO (responseListener event  handle)
+  _ <- forkIO (connectionSender source handle)
   types <- newMVar M.empty
-  let conn = Connection req types
+  let conn = Connection request event types
   authenticate conn connectInfo
   return conn
 
--- | a mux process accepts requests from external programs,  sends
--- the request to the database,  and tells the demuxer where to send
--- the result.
+-- | requestListener listens for incoming database queries
+-- from Haskell code,  and handles them accordingly
 
-mux = loop
+requestListener :: MVar Event -> MVar () -> MVar Dialog -> IO a
+requestListener event throttle request = loop
   where
-    loop req h demux = do
-       (str, dest) <- takeMVar req `catches`
-                     [ handler req demux :: BlockedIndefinitelyOnMVar -> IO a
-                     , handler req demux :: DatabaseClosedException   -> IO a ]
-       writeSink demux dest
-       L.hPut h str `catch` \(x :: IOException) -> closed req
-       loop req h demux
+    loop = do
+      ()  <- takeMVar throttle
+      req <- takeMVar request
+      putMVar event (Request req)
+      loop
 
-    handler req demux x = do
-       -- FIXME:  we should send a "close the connection" message to
-       -- the database.   But when?  Can we send the message now
-       -- and keep the connection open until we finish getting results?
-       -- Or do we have to wait and have the demux send the message?
-       
-       -- It sounds like a terminate message will cause an immediate hangup
-       writeSink demux (throw DatabaseClosedException)
-       closed req
+-- | responseListener listens for messages coming in on the network
+-- socket from the PostgreSQL server.  Normal messages are sent back
+-- to the connectionRouter to be directed to the correct destination,
+-- but async notices and async notifications are routed by the
+-- responseListener process directly.
 
-    closed req = do
-        (_str, dest) <- takeMVar' req
-        writeSink dest  (throw DatabaseClosedException)
-        closed req
-      where
-        takeMVar' req = takeMVar req `catch`
-              \(_ :: DatabaseClosedException) -> takeMVar' req
-
--- | a demux process listens on a database connection and sends
--- the incoming messages to the appropriate destination.
-
-demux h dests = loop
+responseListener :: MVar Event -> Handle -> IO a
+responseListener event handle = loop
   where
-    nextDest = do
-      -- If I block on dests, then I can't receive async notifications
-      -- If I block on the handle,  then I can't receive database disconnects
-      -- I could signal database disconnects with an asynchronous exception,
-      -- but that's just *asking* for trouble.
-      dest <- readSource dests `catch` databaseClosed
-      msg  <- getMessage_ h
-      loop dest msg
+    loop = do
+      rspMsg <- getMessage_ handle `catch` \(e :: ConnectionClosed) -> do
+                                                putMVar event (Disconnected e)
+                                                throwIO e
+      -- FIXME:  detect async notices and notifications here and route
+      -- them elsewhere
+      putMVar event (Response rspMsg)
+      loop
 
-    loop dest (messageType, len, block)
-      | L.length block /= len = do
-           x <- IO.hIsEOF h
-           if x
-             then do
-                writeSink dest DatabaseClosedException
-                closed
-             else error "demux: impossible error"
-      | messageType = 'Z' = do
-           writeSink dest (messageType, block)
-           nextDest
-      | otherwise = do
-           writeSink dest (messageType, block)
-           loop dest =<< getMessage_ h
+-- | the ConnectionSender writes data to the network
 
-    closed = do
-      dest <- readSource dests
-      writeSink dest (throw DatabaseClosedException)
-      closed
+connectionSender :: Source (Source ReqMsg) -> Handle -> IO a
+connectionSender sources handle = nextSource
+  where
+    nextSource = loop =<< readSource sources
 
-    databaseClosed :: DatabaseClosedException -> IO a
-    databaseClosed e = hClose h >> throwIO e
+    loop source = do
+      msg <- readSource source
+--      print msg
+      case msg of
+        Done       -> nextSource
+        ReqMsg msg -> L.hPut handle msg >> loop source
 
-{-
-An alternative design would be 
+maxActiveRequests :: Int
+maxActiveRequests = 8
 
-   Connection Server     Request sucker     Response Sucker
+nextIdx :: Int -> Int
+{--
+nextIdx n | n == maxActiveRequests - 1 = 0
+          | otherwise                  = n + 1
+--}
 
-But how would you throttle the incoming requests?  The current design
-has an "elegant feel" to it,  but perhaps it's fundamentally flawed.
+nextIdx n = (n+1).&.7
 
-Or maybe not.   We want to service a disconnect request as soon as possible,
-we want to keep the connection open for as long as we are receive data,  but 
-we want to stop accepting requests.  Pending requests 
-should be sent a DatabaseClosedException.  
+writeSinkVector :: V.IOVector (MVar (Item a)) -> Int -> a -> IO ()
+writeSinkVector arr idx a = do
+   new_hole <- newEmptyMVar
+   hole <- V.read arr idx
+   V.write arr idx new_hole
+   putMVar hole (Item a new_hole)
 
-This would require more threads
+writeAndCloseSinkVector :: Exception e
+                        => V.IOVector (MVar (Item a))
+                        -> Int -> a -> e -> IO ()
+writeAndCloseSinkVector arr idx a e = do
+   mb <- newMVar (throw e)
+   hole <- V.read arr idx
+   V.write arr idx mb
+   putMVar hole (Item a mb)
 
--}
+-- | The connectionRouter is by far the most complicated process
+--   in the team.   It is responsible for
+--
+--   1.  Hooking up new requests to the connectionSender process
+--
+--   2.  Throttling the rate of requests, so that we don't send 
+--       requests faster than the database can respond.
+--
+--   3.  Tracking new requests so that it can determine where
+--       to send the results.
+--
+--   4.  Sending the results to the correct location.
+--
+--   5.  Handling disconnects and closing the handle.
+--
+-- Closing the connection turns out to be slightly tricky.  In
+-- order to maintain the illusion that we aren't pulling any
+-- shenanigans with unsafeInterleaveIO,  we need to immediately
+-- stop accepting new requests,  but hold the database connection
+-- open until the server is finished sending results.
+--
+-- It may make sense to add a "rude" shutdown that immediately
+-- closes the connection as well.  But in most cases,  a soft shutdown
+-- is what you want.
 
+connectionRouter :: MVar Event -> MVar () -> Sink (Source ReqMsg) -> Handle 
+                 -> IO a
+connectionRouter event throttle sender handle = do
+    sinks <- V.new maxActiveRequests
+    let loop reqIdx maxIdx = do
+            evt <- takeMVar event
+            case evt of
+              Request (Dialog source sink) -> do
+--                  putStrLn "request"
+                  writeSink sender source
+                  V.write sinks maxIdx sink
+                  let idx = nextIdx maxIdx
+                  when (idx /= reqIdx) (putMVar throttle ())
+                  loop reqIdx idx
+              Response msg@(RspMsg 'Z' _block) -> do
+--                  print msg
+                  writeAndCloseSinkVector sinks reqIdx msg 
+                                          InternalException
+                  _ <- tryPutMVar throttle ()
+                  loop (nextIdx reqIdx) maxIdx
+              Response msg -> do
+--                  print msg
+                  writeSinkVector sinks reqIdx msg
+                  loop reqIdx maxIdx
+              Disconnected _ -> do
+                  putStrLn "disconnect"
+                  closed reqIdx maxIdx
+        closed reqIdx maxIdx = do
+            _ <- tryPutMVar throttle ()
+            evt <- takeMVar event
+            case evt of
+              Request (Dialog _source sink) -> do
+                  putMVar sink (throw ConnectionClosed)
+                  closed reqIdx maxIdx
+              Response msg@(RspMsg 'Z' _block) -> do
+                  writeAndCloseSinkVector sinks reqIdx msg
+                                          InternalException
+                  let idx = nextIdx reqIdx
+                  when (idx == maxIdx) $ do
+                     -- FIXME: send a Terminate message
+                     hClose handle
+                  closed idx maxIdx
+              Response msg -> do
+                  writeSinkVector sinks reqIdx msg
+                  closed reqIdx maxIdx
+              Disconnected _ -> do
+                  closed reqIdx maxIdx
+    loop 0 0
 
 -- | Run a an action with a connection and close the connection
 --   afterwards (protects against exceptions).
@@ -211,10 +277,12 @@ begin conn = do
   return ()
 
 -- | Close a connection. Can safely be called any number of times.
+-- Don't call it from a large number of threads,  otherwise you can
+-- DoS the connectionRouter.
 close :: MonadIO m => Connection -- ^ The connection.
       -> m ()
-close Connection{connectionRequest} = liftIO $ do
-    putMVar connectionRequest (throw DatabaseClosedException)
+close Connection{connectionEvent} = liftIO $ do
+    putMVar connectionEvent (Disconnected ConnectionClosed)
 
 -- | Run a simple query on a connection.
 query :: (MonadCatchIO m)
@@ -279,11 +347,12 @@ authenticate conn@Connection{..} connectInfo = do
   withConnection conn $ \h -> do
     sendStartUp h connectInfo
     getConnectInfoResponse h connectInfo
+  withConnection conn $ \h -> do
     objects <- objectIds h
     modifyMVar_ connectionObjects (\_ -> return objects)
 
 -- | Send the start-up message.
-sendStartUp :: Handle -> ConnectInfo -> IO ()
+sendStartUp :: PGHandle -> ConnectInfo -> IO ()
 sendStartUp h ConnectInfo{..} = do
   sendBlock h Nothing $ do
     int32 protocolVersion
@@ -292,7 +361,7 @@ sendStartUp h ConnectInfo{..} = do
     zero
 
 -- | Wait for and process the connectInfoentication response from the server.
-getConnectInfoResponse :: Handle -> ConnectInfo -> IO ()
+getConnectInfoResponse :: PGHandle -> ConnectInfo -> IO ()
 getConnectInfoResponse h conninfo = do
   (typ,block) <- getMessage h
   -- TODO: Handle connectInfo failure. Handle information messages that are
@@ -312,7 +381,7 @@ getConnectInfoResponse h conninfo = do
     els -> E.throw $ AuthenticationFailed (show (els,block))
 
 -- | Send the pass as clear text and wait for connect response.
-sendPassClearText :: Handle -> ConnectInfo -> IO ()
+sendPassClearText :: PGHandle -> ConnectInfo -> IO ()
 sendPassClearText h conninfo@ConnectInfo{..} = do
   sendMessage h PasswordMessage $
     string (fromString connectPassword)
@@ -329,7 +398,7 @@ sendPassClearText h conninfo@ConnectInfo{..} = do
 --------------------------------------------------------------------------------
 -- Initialization
 
-objectIds :: Handle -> IO (Map ObjectId String)
+objectIds :: PGHandle -> IO (Map ObjectId String)
 objectIds h = do
     Result{..} <- sendQuery M.empty h q
     case resultType of
@@ -345,7 +414,7 @@ objectIds h = do
 -- Queries and commands
 
 -- | Send a simple query.
-sendQuery :: Map ObjectId String -> Handle -> ByteString -> IO Result
+sendQuery :: Map ObjectId String -> PGHandle -> ByteString -> IO Result
 sendQuery types h sql = do
   sendMessage h Query $ string sql
   listener $ \continue -> do
@@ -536,7 +605,7 @@ types = [('C',CommandComplete)
         ,('p',PasswordMessage)]
 
 -- | Blocks until receives ReadyForQuery.
-waitForReady :: Handle -> IO ()
+waitForReady :: PGHandle -> IO ()
 waitForReady h = loop where
   loop = do
   (typ,block) <- getMessage h
@@ -549,26 +618,28 @@ waitForReady h = loop where
 -- Connections
 
 -- | Atomically perform an action with the database handle, if there is one.
-withConnection :: Connection -> (Handle -> IO a) -> IO a
-withConnection Connection{..} m = do
-  withMVar connectionHandle $ \h -> do
-    case h of
-      Just h -> m h
-      -- TODO: Use extensible exceptions.
-      Nothing -> E.throw ConnectionLost
+withConnection :: Connection -> (PGHandle -> IO a) -> IO a
+withConnection Connection{connectionRequest} m = do
+    (reqSource,reqSink) <- newEdge
+    rspSink <- newEmptyMVar
+    rspSource <- Source `fmap` newMVar rspSink
+    putMVar connectionRequest (Dialog reqSource rspSink)
+    a <- m (PGHandle rspSource reqSink)
+    writeSink reqSink Done
+    return a
 
 -- | Send a block of bytes on a handle, prepending the message type
 --   and complete length.
-sendMessage :: Handle -> MessageType -> Put -> IO ()
+sendMessage :: PGHandle -> MessageType -> Put -> IO ()
 sendMessage h typ output =
   case charFromType typ of
     Just char -> sendBlock h (Just char) output
     Nothing   -> error $ "sendMessage: Bad message type " ++ show typ
 
 -- | Send a block of bytes on a handle, prepending the complete length.
-sendBlock :: Handle -> Maybe Char -> Put -> IO ()
-sendBlock h typ output = do
-  L.hPutStr h bytes
+sendBlock :: PGHandle -> Maybe Char -> Put -> IO ()
+sendBlock (PGHandle _ sink) typ output = do
+  writeSink sink (ReqMsg bytes)
     where bytes = start `mappend` out
           start = runPut $ do
             maybe (return ()) (put . toByte) typ
@@ -578,18 +649,29 @@ sendBlock h typ output = do
           toByte c = fromIntegral (fromEnum c) :: Word8
 
 -- | Get a message (block) from the stream.
-getMessage_ :: Handle -> IO (Char,Int,L.ByteString)
+getMessage_ :: Handle -> IO RspMsg
 getMessage_ h = do
-  messageType <- L.hGet h 1
-  blockLength <- L.hGet h int32Size
-  let typ = decode messageType
-      rest = fromIntegral (decode blockLength :: Int32) - int32Size
-  block <- L.hGet h rest
-  return (typ,rest,block)
-
-getMessage :: Handle -> IO (MessageType,L.ByteString)
-getMessage h = do
-  (typ,_, block) <- getMessage_ h
+    messageType <- L.hGet h 1
+    blockLength <- L.hGet h int32Size
+    if fromIntegral (L.length blockLength) < int32Size
+    then eof
+    else do
+      let typ = decode messageType
+          rest = fromIntegral (decode blockLength :: Int32) - int32Size
+      block <- L.hGet h rest
+      if fromIntegral (L.length block) < rest
+      then eof
+      else return (RspMsg typ block)
+  where
+    eof = do
+        isEOF <- hIsEOF h
+        if isEOF
+        then throwIO ConnectionLost
+        else fail "getMessage_:  the impossible just happened"
+    
+getMessage :: PGHandle -> IO (MessageType,L.ByteString)
+getMessage (PGHandle source _) = do
+  (RspMsg typ block) <- readSource source 
   return (maybe UnknownMessageType id $ typeFromChar typ,block)
 
 --------------------------------------------------------------------------------

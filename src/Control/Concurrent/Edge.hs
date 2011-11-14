@@ -1,7 +1,9 @@
 module Control.Concurrent.Edge
      ( Edge
-     , Sink
-     , Source
+     , Sink(..)
+     , Source(..)
+     , List
+     , Item(..)
      , newEdge
      , newSink
      , getSource
@@ -14,12 +16,12 @@ module Control.Concurrent.Edge
 import Control.Concurrent.MVar
 import System.IO.Unsafe(unsafeInterleaveIO)
 
-type Edge a = (Source, Sink a)
+type Edge a = (Source a, Sink a)
 
 type List a = MVar (Item a)
 
 -- In more general settings,  "a" probably ought not be strict
-data Item a = Item !a !(List a)
+data Item a = Item a (List a)
 
 -- | a sink is something that elements can be written to
 newtype Sink   a = Sink   (MVar (List a))
@@ -56,8 +58,8 @@ readSource (Source readVar) = do
       (Item val new_read_end) <- readMVar read_end
       return (new_read_end, val)
 
-writeSink :: a -> Sink a -> IO ()
-writeSink a (Sink writeVar) = do
+writeSink :: Sink a -> a -> IO ()
+writeSink (Sink writeVar) a = do
     modifyMVar_ writeVar $ \hole -> do
       new_hole <- newEmptyMVar
       putMVar hole (Item a new_hole)
@@ -71,7 +73,7 @@ fold :: (a -> b -> b) -> Source a -> IO b
 fold f source = unsafeFold f =<< dupSource source
 
 -- | unsafeFold should usually only be called on sources that
--- have one reader.  If there is more than one reader, then 
+-- have one reader.  If there is more than one reader, then
 -- the result will be affected by race conditions.
 
 unsafeFold :: (a -> b -> b) -> Source a -> IO b

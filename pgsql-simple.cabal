@@ -18,6 +18,7 @@ extra-source-files:
     README.markdown
 
 library
+  hs-source-dirs: src
   exposed-modules:
     Database.PostgreSQL.Simple
     Database.PostgreSQL.Simple.Param
@@ -28,6 +29,7 @@ library
   other-modules:
     Database.PostgreSQL.Base
     Database.PostgreSQL.Base.Types
+    Control.Concurrent.Edge
 
   build-depends:
     attoparsec >= 0.8.5.3,
@@ -45,6 +47,7 @@ library
     mtl >= 2.0,
     MonadCatchIO-transformers >= 0.2,
     utf8-string >= 0.3 && < 0.4,
+    vector,
     containers >= 0.3
 
   ghc-options: -Wall -O2
