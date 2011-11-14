@@ -70,7 +70,7 @@ data    RspMsg  = RspMsg !Char !L.ByteString
 
 data    Event   = Request  Dialog
                 | Response RspMsg
-                | Disconnected ConnectionClosed
+                | Disconnect ConnectionClosed
 
 data Notification  = Notification
                       { notificationPid     :: Int

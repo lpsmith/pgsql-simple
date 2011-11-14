@@ -109,7 +109,9 @@ requestListener event throttle request = loop
   where
     loop = do
       ()  <- takeMVar throttle
-      req <- takeMVar request
+      req <- takeMVar request `catch` \(e :: BlockedIndefinitelyOnMVar) -> do
+                                   putMVar event (Disconnect ConnectionClosed)
+                                   throwIO e
       putMVar event (Request req)
       loop
 
@@ -124,7 +126,7 @@ responseListener event handle notifications = loop
   where
     loop = do
       rspMsg <- getMessage_ handle `catch` \(e :: ConnectionClosed) -> do
-                                                putMVar event (Disconnected e)
+                                                putMVar event (Disconnect e)
                                                 throwIO e
       case rspMsg of
         RspMsg 'A' msg  -> writeSink notifications (getNotification msg)
@@ -222,7 +224,7 @@ connectionRouter event throttle sender handle = do
 --                  print msg
                   writeSinkVector sinks reqIdx msg
                   loop reqIdx maxIdx
-              Disconnected _ -> do
+              Disconnect _ -> do
                   -- FIXME: handle lost connections properly
                   putStrLn "disconnect"
                   closed reqIdx maxIdx
@@ -244,7 +246,7 @@ connectionRouter event throttle sender handle = do
               Response msg -> do
                   writeSinkVector sinks reqIdx msg
                   closed reqIdx maxIdx
-              Disconnected _ -> do
+              Disconnect _ -> do
                   closed reqIdx maxIdx
     loop 0 0
 
@@ -285,7 +287,7 @@ begin conn = do
 close :: MonadIO m => Connection -- ^ The connection.
       -> m ()
 close Connection{connectionEvent} = liftIO $ do
-    putMVar connectionEvent (Disconnected ConnectionClosed)
+    putMVar connectionEvent (Disconnect ConnectionClosed)
 
 -- | Run a simple query on a connection.
 query :: (MonadCatchIO m)
