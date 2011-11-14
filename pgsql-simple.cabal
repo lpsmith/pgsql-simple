@@ -26,6 +26,7 @@ library
     Database.PostgreSQL.Simple.QueryResults
     Database.PostgreSQL.Simple.Result
     Database.PostgreSQL.Simple.Types
+    Database.PostgreSQL.Simple.Notification
   other-modules:
     Database.PostgreSQL.Base
     Database.PostgreSQL.Base.Types

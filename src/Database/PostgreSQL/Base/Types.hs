@@ -53,6 +53,7 @@ data ConnectInfo = ConnectInfo {
 data Connection = Connection {
       connectionRequest       :: MVar Dialog
     , connectionEvent         :: MVar Event
+    , connectionNotification  :: Sink Notification
     , connectionObjects       :: MVar (Map ObjectId String)
     }
 
@@ -70,6 +71,14 @@ data    RspMsg  = RspMsg !Char !L.ByteString
 data    Event   = Request  Dialog
                 | Response RspMsg
                 | Disconnected ConnectionClosed
+
+data Notification  = Notification
+                      { notificationPid     :: Int
+                      , notificationChannel :: L.ByteString
+                      , notificationData    :: L.ByteString
+                      }
+
+data NotificationChannel = NotificationChannel Connection (Source Notification)
 
 -- | Result of a database query.
 data Result =
@@ -103,7 +112,7 @@ data Field = Field {
    ,fieldFormatCode :: FormatCode
   } deriving Show
 
-data Type = 
+data Type =
     Short      -- ^ 2 bytes, small-range integer
   | Long       -- ^ 4 bytes, usual choice for integer
   | LongLong   -- ^ 8 bytes	large-range integer
@@ -115,13 +124,13 @@ data Type =
   | CharVarying -- ^ character varying(n), varchar(n), variable-length
   | Characters  -- ^ character(n), char(n), fixed-length
   | Text        -- ^ text, variable unlimited length
-              -- 
+              --
               -- Lazy. Decoded from UTF-8 into Haskell native encoding.
 
   | Boolean -- ^ boolean, 1 byte, state of true or false
 
   | Timestamp -- ^ timestamp /without/ time zone
-              -- 
+              --
               -- More information about PostgreSQL’s dates here:
               -- <http://www.postgresql.org/docs/current/static/datatype-datetime.html>
   | TimestampWithZone -- ^ timestamp /with/ time zone
@@ -155,12 +164,11 @@ newtype Pool = Pool { unPool :: MVar PoolState }
 
 
 data ConnectionClosed = ConnectionClosed
-  deriving (Show, Typeable) 
+  deriving (Show, Typeable)
 
 instance Exception ConnectionClosed
 
 data InternalException = InternalException
-  deriving (Show, Typeable) 
+  deriving (Show, Typeable)
 
 instance Exception InternalException
-
