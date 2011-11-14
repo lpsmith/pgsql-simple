@@ -165,11 +165,10 @@ writeSinkVector arr idx a = do
    V.write arr idx new_hole
    putMVar hole (Item a new_hole)
 
-writeAndCloseSinkVector :: Exception e
-                        => V.IOVector (MVar (Item a))
-                        -> Int -> a -> e -> IO ()
-writeAndCloseSinkVector arr idx a e = do
-   mb <- newMVar (throw e)
+writeAndCloseSinkVector :: V.IOVector (MVar (Item a))
+                        -> Int -> a -> IO ()
+writeAndCloseSinkVector arr idx a = do
+   mb <- newMVar (throw InternalException)
    hole <- V.read arr idx
    V.write arr idx mb
    putMVar hole (Item a mb)
@@ -216,7 +215,6 @@ connectionRouter event throttle sender handle = do
               Response msg@(RspMsg 'Z' _block) -> do
 --                  print msg
                   writeAndCloseSinkVector sinks reqIdx msg
-                                          InternalException
                   _ <- tryPutMVar throttle ()
                   loop (nextIdx reqIdx) maxIdx
               Response msg -> do
@@ -235,7 +233,7 @@ connectionRouter event throttle sender handle = do
                   putMVar hole (throw ConnectionClosed)
                   shutdown reqIdx maxIdx
               Response msg@(RspMsg 'Z' _block) -> do
-                  writeAndCloseSinkVector sinks reqIdx msg InternalException
+                  writeAndCloseSinkVector sinks reqIdx msg
                   let idx = nextIdx reqIdx
                   if idx == maxIdx
                   then do
