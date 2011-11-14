@@ -33,7 +33,6 @@ data ConnectionError =
   | QueryEmpty                  -- ^ The query was empty.
   | AuthenticationFailed String -- ^ Connecting failed due to authentication problem.
   | InitializationError String  -- ^ Initialization (e.g. getting data types) failed.
-  | ConnectionLost              -- ^ Connection was lost when using withConnection.
   | UnsupportedAuthenticationMethod Int32 String -- ^ Unsupported method of authentication (e.g. md5).
   | GeneralError String
   deriving (Typeable,Show)
@@ -163,7 +162,7 @@ data PoolState = PoolState {
 newtype Pool = Pool { unPool :: MVar PoolState }
 
 
-data ConnectionClosed = ConnectionClosed
+data ConnectionClosed = ConnectionClosed | ConnectionLost
   deriving (Show, Typeable)
 
 instance Exception ConnectionClosed

@@ -50,7 +50,6 @@ import           Network
 import           Prelude                        hiding (catch)
 import           System.IO                      hiding (hPutStr)
 import           Data.Bits((.&.))
-import           Debug.Trace
 
 --------------------------------------------------------------------------------
 -- Exported values
@@ -224,30 +223,47 @@ connectionRouter event throttle sender handle = do
 --                  print msg
                   writeSinkVector sinks reqIdx msg
                   loop reqIdx maxIdx
-              Disconnect _ -> do
-                  -- FIXME: handle lost connections properly
-                  putStrLn "disconnect"
-                  closed reqIdx maxIdx
-        closed reqIdx maxIdx = do
+              Disconnect ConnectionClosed -> do
+                  shutdown reqIdx maxIdx
+              Disconnect ConnectionLost -> do
+                  halt reqIdx maxIdx
+        shutdown reqIdx maxIdx = do
             _ <- tryPutMVar throttle ()
             evt <- takeMVar event
             case evt of
-              Request (Dialog _source sink) -> do
-                  putMVar sink (throw ConnectionClosed)
-                  closed reqIdx maxIdx
+              Request (Dialog _source hole) -> do
+                  putMVar hole (throw ConnectionClosed)
+                  shutdown reqIdx maxIdx
               Response msg@(RspMsg 'Z' _block) -> do
-                  writeAndCloseSinkVector sinks reqIdx msg
-                                          InternalException
+                  writeAndCloseSinkVector sinks reqIdx msg InternalException
                   let idx = nextIdx reqIdx
-                  when (idx == maxIdx) $ do
-                     -- FIXME: send a Terminate message
+                  if idx == maxIdx
+                  then do
+                     -- fixme:  send a termination message
                      hClose handle
-                  closed idx maxIdx
+                     closed ConnectionClosed
+                  else do
+                     shutdown idx maxIdx
               Response msg -> do
                   writeSinkVector sinks reqIdx msg
-                  closed reqIdx maxIdx
-              Disconnect _ -> do
-                  closed reqIdx maxIdx
+                  shutdown reqIdx maxIdx
+              Disconnect ConnectionClosed -> do
+                  shutdown reqIdx maxIdx
+              Disconnect ConnectionLost -> do
+                  halt reqIdx maxIdx
+        halt reqIdx maxIdx = do
+            let idxs = takeWhile (/= maxIdx) (iterate nextIdx reqIdx)
+            forM_ idxs $ \idx -> do
+                hole <- V.read sinks idx
+                putMVar hole (throw ConnectionLost)
+            closed ConnectionLost
+        closed status = do
+            _ <- tryPutMVar throttle ()
+            evt <- takeMVar event
+            case evt of
+              Request (Dialog _source hole) -> putMVar hole (throw status)
+              _ -> return ()
+            closed status
     loop 0 0
 
 -- | Run a an action with a connection and close the connection
