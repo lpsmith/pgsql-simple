@@ -35,7 +35,7 @@ import Data.List (foldl')
 import Data.Ratio (Ratio)
 import Data.Time.Calendar (Day, fromGregorian)
 import Data.Time.Clock (UTCTime)
-import Data.Time.Format (parseTime)
+import Data.Time.Format (parseTime, ParseTime)
 import Data.Time.LocalTime (TimeOfDay,LocalTime,ZonedTime,makeTimeOfDayValid)
 import Data.Typeable (TypeRep, Typeable, typeOf)
 import Data.Word (Word, Word16, Word32, Word64)
@@ -148,10 +148,10 @@ instance Result LocalTime where
     convert f = doConvert f ok $ \bs ->
                 case parseLocalTime (B8.unpack bs) of
                   Just t -> t
-                  Nothing -> conversionFailed f "UTCTime" "could not parse"
+                  Nothing -> conversionFailed f "LocalTime" ("could not parse:  " ++ B8.unpack bs)
         where ok = mkCompats [TimestampWithZone]
 
-parseLocalTime :: String -> Maybe LocalTime
+parseLocalTime :: ParseTime t => String -> Maybe t
 parseLocalTime s =
   parseTime defaultTimeLocale "%F %T%Q" s <|>
   parseTime defaultTimeLocale "%F %T%Q%z" (s ++ "00")
@@ -160,18 +160,18 @@ instance Result ZonedTime where
     convert f = doConvert f ok $ \bs ->
                 case parseZonedTime (B8.unpack bs) of
                   Just t -> t
-                  Nothing -> conversionFailed f "UTCTime" "could not parse"
+                  Nothing -> conversionFailed f "ZonedTime" ("could not parse:  " ++ B8.unpack bs)
         where ok = mkCompats [TimestampWithZone]
 
-parseZonedTime :: String -> Maybe ZonedTime
+parseZonedTime ::  ParseTime t => String -> Maybe t
 parseZonedTime s =
   parseTime defaultTimeLocale "%F %T%Q%z" (s ++ "00")
 
 instance Result UTCTime where
     convert f = doConvert f ok $ \bs ->
-                case parseTime defaultTimeLocale "%F %T%Q" (B8.unpack bs) of
+                case parseLocalTime (B8.unpack bs) of
                   Just t -> t
-                  Nothing -> conversionFailed f "UTCTime" "could not parse"
+                  Nothing -> conversionFailed f "UTCTime" ("could not parse:  " ++ B8.unpack bs)
         where ok = mkCompats [TimestampWithZone]
 
 instance Result Day where
