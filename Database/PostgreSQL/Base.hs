@@ -174,10 +174,10 @@ protocolVersion = 196608
 
 -- | Escape a string for PostgreSQL.
 escape :: String -> String
-escape ('\\':cs) = '\\' : '\\' : escape cs
-escape ('\'':cs) = '\'' : '\'' : escape cs
-escape (c:cs) = c : escape cs
-escape [] = []
+escape = foldr delta [] 
+   where 
+      delta '\'' xs = '\'' : '\'' : xs
+      delta x    xs = x : xs
 
 -- | Escape a string for PostgreSQL.
 escapeBS :: ByteString -> ByteString
